@@ -1,0 +1,52 @@
+# ── Node ──────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ── Environment / Secrets ─────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+backend/.env
+
+# ── Frontend build output ─────────────────────────────────────────
+frontend/dist/
+frontend/.vite/
+frontend/build/
+
+# ── Python ────────────────────────────────────────────────────────
+database/venv/
+database/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+.Python
+
+# ── PaySim raw dataset (470 MB — too large for git) ───────────────
+database/raw_data/
+*.csv
+
+# ── Generated SQL files (re-created by pipeline script) ──────────
+database/realistic_seed.sql
+
+# ── OS / Editor ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/settings.json
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ── Logs ─────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── MySQL Workbench exports ───────────────────────────────────────
+*.mwb.bak
