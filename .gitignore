@@ -29,8 +29,9 @@ __pycache__/
 database/raw_data/
 *.csv
 
-# ── Generated SQL files (re-created by pipeline script) ──────────
+# ── Generated SQL files (re-created by pipeline scripts) ─────────
 database/realistic_seed.sql
+database/beneficiaries_seed.sql
 
 # ── OS / Editor ───────────────────────────────────────────────────
 .DS_Store
