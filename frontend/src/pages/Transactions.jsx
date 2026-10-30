@@ -189,6 +189,7 @@ const Transactions = () => {
   const [otpModal, setOtpModal]         = useState(false);
   const [otpCode, setOtpCode]           = useState('');
   const [demoOtp, setDemoOtp]           = useState('');   // shown on screen (demo)
+  const [otpToken, setOtpToken]         = useState('');   // signed token echoed back to server
   const [otpSubmitting, setOtpSubmit]   = useState(false);
   const [pendingPayload, setPendingPayload] = useState(null);
 
@@ -262,6 +263,7 @@ const Transactions = () => {
           };
           const { data } = await api.post('/transactions/request-otp', payload);
           setDemoOtp(data.otp);
+          setOtpToken(data.otpToken);   // store signed token — sent back on verify
           setPendingPayload(payload);
           setOtpCode('');
           setOtpModal(true);
@@ -302,9 +304,9 @@ const Transactions = () => {
     if (!otpCode.trim()) { toast.error('Please enter the OTP'); return; }
     setOtpSubmit(true);
     try {
-      const { data } = await api.post('/transactions/verify-otp', { otp: otpCode });
+      const { data } = await api.post('/transactions/verify-otp', { otp: otpCode, otpToken });
       toast.success('OTP verified! Transfer submitted for admin approval 🎉');
-      setOtpModal(false); setOtpCode(''); setDemoOtp(''); setPendingPayload(null);
+      setOtpModal(false); setOtpCode(''); setDemoOtp(''); setOtpToken(''); setPendingPayload(null);
       setActiveOp(null); setToAccNumber(''); setResolvedToAcc(null);
       setForm(f => ({ ...f, amount: '', idempotency_key: uuidv4() }));
       loadTxns(selectedAcc, 0);

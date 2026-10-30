@@ -68,11 +68,14 @@ const requestOTP = async (req, res, next) => {
     if (accounts[0].customer_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
 
     const transferPayload = { from_account_id, to_account_id, amount, idempotency_key: idempotency_key || uuidv4() };
-    const otp = await generateOTP({ customerId: req.user.id, transferPayload });
+
+    // Stateless: returns { otp (raw, demo-only), otpToken (signed JWT — no DB write) }
+    const { otp, otpToken } = await generateOTP({ customerId: req.user.id, transferPayload });
 
     return res.json({
       message: `OTP generated. In production this would be sent via SMS/email. For demo, use this OTP:`,
-      otp,                         // ← returned directly (demo only)
+      otp,           // raw digit shown in UI for demo
+      otpToken,      // signed JWT — frontend must echo this back on /verify-otp
       expires_in_seconds: 300,
       threshold: HIGH_AMOUNT_THRESHOLD,
     });
@@ -85,10 +88,12 @@ const requestOTP = async (req, res, next) => {
  */
 const verifyOTPAndTransfer = async (req, res, next) => {
   try {
-    const { otp } = req.body;
-    if (!otp) return res.status(400).json({ error: 'otp is required' });
+    const { otp, otpToken } = req.body;
+    if (!otp)      return res.status(400).json({ error: 'otp is required' });
+    if (!otpToken) return res.status(400).json({ error: 'otpToken is required' });
 
-    const payload = await verifyOTP({ customerId: req.user.id, otp });
+    // Stateless verification — no DB lookup, just JWT signature + HMAC check
+    const payload = await verifyOTP({ otpToken, userEnteredOTP: otp });
 
     // Verify source ownership again
     const [accounts] = await pool.query('SELECT customer_id FROM accounts WHERE id = ?', [payload.from_account_id]);
