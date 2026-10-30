@@ -1,7 +1,11 @@
 # Mini Banking System — Comprehensive SQL Query Documentation
 
-> **Schema version**: includes `migration_admin.sql` (flagging, OTP, approvals).
-> All queries are executed by the Node.js backend via the `mysql2` connection pool.
+> **Schema version**: includes `database/migration_admin.sql` (flagging, OTP, approval columns).
+> All queries executed by the Node.js backend via the `mysql2` connection pool.
+>
+> **Legend for source references**:
+> Each query entry includes a `📄 Source` field with the **full file path** and **exact line number(s)**
+> where that SQL statement is executed in the codebase.
 
 ---
 
@@ -37,52 +41,62 @@
 
 ## 1. Authentication
 
-### 1.1 Login — Find customer by email
+### 1.1 Register — Duplicate email check
 
-**Frontend trigger**: User submits the Login form.
+**Endpoint**: `POST /api/auth/register`
+
+```sql
+SELECT id FROM customers WHERE email = ?
+```
+
+> 📄 **Source**: `backend/src/controllers/authController.js` — **Line 19**
+
+| Variable | Source |
+|---|---|
+| `?` | `req.body.email` |
+
+**Index hit**: `idx_customers_email (email)` — unique index, single-row O(log n) lookup.
+
+---
+
+### 1.2 Register — Insert new customer
+
+```sql
+INSERT INTO customers (name, email, phone, password_hash, role)
+VALUES (?, ?, ?, ?, ?)
+```
+
+> 📄 **Source**: `backend/src/controllers/authController.js` — **Lines 26–29**
+
+**Business logic**: Password is hashed with `bcrypt` (10 rounds) before insert. Duplicate email raises `ER_DUP_ENTRY`.
+
+---
+
+### 1.3 Login — Find customer by email
+
+**Endpoint**: `POST /api/auth/login`
 
 ```sql
 SELECT id, name, email, password_hash, role
 FROM customers
-WHERE email = :email
-LIMIT 1;
+WHERE email = ?
 ```
 
-| Variable | Source | Description |
-|---|---|---|
-| `:email` | POST body `email` | Looked up by exact unique index |
-
-**Index hit**: `idx_customers_email (email)` — unique index, single-row lookup O(log n).
-
-**Business logic**: `password_hash` is compared using `bcrypt.compare()` in Node.js. JWT token is issued on success containing `{ id, name, role }`.
-
----
-
-### 1.2 Register — Create new customer
-
-```sql
-INSERT INTO customers (name, email, phone, password_hash, role)
-VALUES (:name, :email, :phone, :hash, 'CUSTOMER');
-```
-
-**Business logic**: Password is hashed with `bcrypt` (10 rounds) before insert. Email uniqueness is enforced by the `UNIQUE` constraint; a duplicate raises error `ER_DUP_ENTRY`.
-
----
-
-### 1.3 Auth middleware — Validate JWT on every protected request
-
-```sql
-SELECT id, name, email, role
-FROM customers
-WHERE id = :id
-LIMIT 1;
-```
+> 📄 **Source**: `backend/src/controllers/authController.js` — **Lines 55–58**
 
 | Variable | Source |
 |---|---|
-| `:id` | Decoded from JWT payload (`req.user.id`) |
+| `?` | `req.body.email` |
 
-**Index hit**: PRIMARY KEY — O(1) lookup.
+**Index hit**: `idx_customers_email (email)` — unique index, O(log n) lookup.
+
+**Business logic**: `password_hash` compared via `bcrypt.compare()`. JWT issued on success containing `{ id, name, role }`.
+
+---
+
+### 1.4 Auth middleware — JWT validation on every protected request
+
+> **Note**: The `authenticate` middleware in `backend/src/middleware/auth.js` decodes the JWT in-memory (lines 12–14) — **no DB query** is made. The user payload `{ id, email, role }` is embedded in the token itself and attached to `req.user`.
 
 ---
 
@@ -95,10 +109,16 @@ LIMIT 1;
 ```sql
 SELECT id, name, email, phone, role, created_at
 FROM customers
-WHERE id = :id;
+WHERE id = ?
 ```
 
-**Index hit**: PRIMARY KEY.
+> 📄 **Source**: `backend/src/controllers/customerController.js` — **Lines 9–12**
+
+| Variable | Source |
+|---|---|
+| `?` | `req.user.id` (from JWT) |
+
+**Index hit**: `PRIMARY KEY (id)` — O(1).
 
 ---
 
@@ -108,64 +128,81 @@ WHERE id = :id;
 
 ```sql
 UPDATE customers
-SET name = :name, phone = :phone
-WHERE id = :id;
+SET name = ?, phone = ?
+WHERE id = ?
 ```
+
+> 📄 **Source**: `backend/src/controllers/customerController.js` — **Lines 29–32**
+
+| Variable | Source |
+|---|---|
+| `name` | `req.body.name` |
+| `phone` | `req.body.phone` (nullable) |
+| `id` | `req.user.id` |
 
 ---
 
 ## 3. Customer Search
 
-### 3.1 Search customers (all authenticated users)
+### 3.1 Browse latest customers (no query)
+
+**Endpoint**: `GET /api/customers/search` (no `q` param)
+
+```sql
+SELECT id, name, email, phone, role, created_at
+FROM customers
+ORDER BY created_at DESC
+LIMIT 20
+```
+
+> 📄 **Source**: `backend/src/controllers/customerController.js` — **Lines 64–66**
+
+---
+
+### 3.2 Search customers by name / email / phone
 
 **Endpoint**: `GET /api/customers/search?q=:query`
 
 ```sql
--- With search query
 SELECT c.id, c.name, c.email, c.phone, c.role, c.created_at,
        COUNT(a.id) AS account_count
 FROM customers c
 LEFT JOIN accounts a ON a.customer_id = c.id
-WHERE c.name  LIKE :pattern
-   OR c.email LIKE :pattern
-   OR c.phone LIKE :pattern
+WHERE c.name  LIKE ?
+   OR c.email LIKE ?
+   OR c.phone LIKE ?
 GROUP BY c.id
 ORDER BY c.name ASC
-LIMIT 50;
+LIMIT 50
 ```
 
-```sql
--- Without search query (browse recent)
-SELECT id, name, email, phone, role, created_at
-FROM customers
-ORDER BY created_at DESC
-LIMIT 20;
-```
+> 📄 **Source**: `backend/src/controllers/customerController.js` — **Lines 71–81**
 
 | Variable | Value |
 |---|---|
-| `:pattern` | `%` + query + `%` (case-insensitive in utf8mb4_unicode_ci) |
+| `?` (×3) | `%` + `req.query.q` + `%` |
 
-**Index hit**: For the LIKE with leading wildcard (`%term%`), MySQL cannot use the `idx_customers_email` index and falls back to a full table scan. For larger datasets, consider a `FULLTEXT INDEX` on `(name, email, phone)`.
+**Index hit**: Leading-wildcard LIKE (`%term%`) cannot use `idx_customers_email` — falls back to full table scan. For large datasets, consider a `FULLTEXT INDEX` on `(name, email, phone)`.
 
-**Business logic**: Returns public-safe fields only (no `password_hash`). Account count is included so users can see how many accounts a customer has before adding as a beneficiary.
+**Business logic**: Returns public-safe fields only (no `password_hash`). Account count included so users can see how many accounts a customer has.
 
 ---
 
 ## 4. Accounts
 
-### 4.1 List my accounts
-
-**Endpoint**: `GET /api/accounts`
+### 4.1 Ownership check (used before deposit/withdraw/transfer)
 
 ```sql
-SELECT id, account_number, account_type, balance, status, version, created_at
-FROM accounts
-WHERE customer_id = :customerId
-ORDER BY created_at ASC;
+SELECT customer_id FROM accounts WHERE id = ?
 ```
 
-**Index hit**: `idx_accounts_customer_id (customer_id)`.
+> 📄 **Source**:
+> - `backend/src/controllers/transactionController.js` — **Line 17** (deposit ownership)
+> - `backend/src/controllers/transactionController.js` — **Line 40** (withdraw ownership)
+> - `backend/src/controllers/transactionController.js` — **Line 66** (OTP request ownership)
+> - `backend/src/controllers/transactionController.js` — **Line 94** (OTP verify ownership)
+> - `backend/src/controllers/transactionController.js` — **Line 136** (transfer source ownership)
+> - `backend/src/controllers/transactionController.js` — **Line 162** (transaction history ownership)
 
 ---
 
@@ -175,10 +212,44 @@ ORDER BY created_at ASC;
 
 ```sql
 INSERT INTO accounts (customer_id, account_number, account_type, balance, status)
-VALUES (:customerId, :accountNumber, :accountType, 0.00, 'ACTIVE');
+VALUES (?, ?, ?, 0.00, 'ACTIVE')
 ```
 
-**Business logic**: Account number is auto-generated as `ACC` + zero-padded counter, guaranteed unique.
+> 📄 **Source**: `backend/src/controllers/accountController.js` — **Lines 26–30**
+
+---
+
+### 4.3 List my accounts
+
+**Endpoint**: `GET /api/accounts`
+
+```sql
+SELECT id, account_number, account_type, balance, status, version, created_at
+FROM accounts
+WHERE customer_id = ?
+ORDER BY created_at DESC
+```
+
+> 📄 **Source**: `backend/src/controllers/accountController.js` — **Lines 53–57**
+
+**Index hit**: `idx_accounts_customer_id (customer_id)`.
+
+---
+
+### 4.4 Get single account (with customer join)
+
+**Endpoint**: `GET /api/accounts/:id`
+
+```sql
+SELECT a.id, a.account_number, a.account_type, a.balance,
+       a.status, a.version, a.created_at,
+       c.name AS customer_name, c.email AS customer_email
+FROM accounts a
+JOIN customers c ON a.customer_id = c.id
+WHERE a.id = ?
+```
+
+> 📄 **Source**: `backend/src/controllers/accountController.js` — **Lines 69–75**
 
 ---
 
@@ -193,161 +264,183 @@ SELECT a.id, a.account_number, a.account_type, a.status,
        c.name AS holder_name
 FROM accounts a
 JOIN customers c ON a.customer_id = c.id
-WHERE a.account_number = :accountNumber
-LIMIT 1;
+WHERE a.account_number = ?
 ```
 
-**Index hit**: `idx_accounts_account_number (account_number)` — unique index, instant lookup.
+> 📄 **Source**: `backend/src/controllers/accountController.js` — **Lines 136–143**
 
-**Business logic**: Used by the frontend transfer form for live recipient verification as the user types (debounced 500 ms). Returns account holder name so the sender can visually confirm they're sending to the right person.
+**Index hit**: `idx_accounts_account_number (account_number)` — unique index, instant O(log n) lookup.
+
+**Business logic**: Used by the frontend transfer form for live recipient verification (debounced). Returns the account holder's name so the sender can visually confirm the recipient.
 
 ---
 
 ## 6. Beneficiaries
 
-### 6.1 List my beneficiaries
-
-**Endpoint**: `GET /api/beneficiaries`
+### 6.1 Validate account exists before adding beneficiary
 
 ```sql
-SELECT b.id, b.nickname, b.created_at,
-       a.account_number, a.account_type,
-       c.name AS account_holder_name
-FROM beneficiaries b
-JOIN accounts a  ON b.account_id  = a.id
-JOIN customers c ON a.customer_id = c.id
-WHERE b.customer_id = :customerId
-ORDER BY b.created_at DESC;
+SELECT id FROM accounts WHERE id = ?
 ```
 
-**Index hit**: `idx_bene_customer_id (customer_id)`.
+> 📄 **Source**: `backend/src/controllers/beneficiaryController.js` — **Line 15**
 
 ---
 
 ### 6.2 Add beneficiary
 
+**Endpoint**: `POST /api/beneficiaries`
+
 ```sql
 INSERT INTO beneficiaries (customer_id, account_id, nickname)
-VALUES (:customerId, :accountId, :nickname);
+VALUES (?, ?, ?)
 ```
 
-**Constraint**: `uq_bene_customer_account (customer_id, account_id)` prevents duplicate beneficiaries.
+> 📄 **Source**: `backend/src/controllers/beneficiaryController.js` — **Lines 18–21**
+
+**Constraint**: `uq_bene_customer_account (customer_id, account_id)` prevents duplicates — raises `ER_DUP_ENTRY` on violation.
 
 ---
 
-### 6.3 Delete beneficiary
+### 6.3 List my beneficiaries
+
+**Endpoint**: `GET /api/beneficiaries`
+
+```sql
+SELECT b.id, b.nickname, b.created_at,
+       a.id AS account_id, a.account_number, a.account_type,
+       c.name AS account_holder_name
+FROM beneficiaries b
+JOIN accounts a  ON b.account_id  = a.id
+JOIN customers c ON a.customer_id = c.id
+WHERE b.customer_id = ?
+ORDER BY b.created_at DESC
+```
+
+> 📄 **Source**: `backend/src/controllers/beneficiaryController.js` — **Lines 40–50**
+
+**Index hit**: `idx_bene_customer_id (customer_id)`.
+
+---
+
+### 6.4 Delete beneficiary
+
+**Endpoint**: `DELETE /api/beneficiaries/:id`
 
 ```sql
 DELETE FROM beneficiaries
-WHERE id = :id AND customer_id = :customerId;
+WHERE id = ? AND customer_id = ?
 ```
+
+> 📄 **Source**: `backend/src/controllers/beneficiaryController.js` — **Lines 62–65**
 
 ---
 
 ## 7. Atomic Transfer
 
-**Endpoint**: `POST /api/transactions/transfer` (< ₹25,000)
-or via admin approval (≥ ₹25,000)
+**Endpoint**: `POST /api/transactions/transfer` (< ₹25,000) or approved high-value.
 
-This is the most critical path in the system. It uses an explicit transaction with carefully ordered `FOR UPDATE` locks to prevent deadlocks and race conditions.
+All queries below run inside a single `BEGIN … COMMIT` block.
 
-### Full BEGIN…COMMIT Flow
+### Step 1 — Idempotency check (FOR SHARE)
 
 ```sql
--- STEP 1: Begin transaction
-BEGIN;
-
--- STEP 2: Idempotency check (shared lock — allows concurrent reads, blocks writes)
 SELECT id, status
 FROM transactions
-WHERE idempotency_key = :idempotencyKey
-FOR SHARE;
--- If rows found → ROLLBACK and return cached result (idempotent replay)
+WHERE idempotency_key = ?
+FOR SHARE
+```
 
--- STEP 3: Lock accounts in ASCENDING ID order (deadlock prevention)
---         Both accounts are locked in a single query, sorted by id.
---         If Thread A locks (id=3, id=7) and Thread B locks (id=7, id=3),
---         without ordering this would deadlock. Ascending order eliminates that.
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 18–21** (`transferService`)
+
+**Lock type**: `FOR SHARE` — allows concurrent reads of this key, blocks any writer trying to insert the same key.
+
+---
+
+### Step 2 — Lock both accounts in ascending ID order
+
+```sql
 SELECT id, balance, status, version, account_number
 FROM accounts
-WHERE id IN (:lowerAccountId, :higherAccountId)
+WHERE id IN (?, ?)
 ORDER BY id ASC
-FOR UPDATE;
+FOR UPDATE
+```
 
--- STEP 4: Business validations (done in application layer on locked rows)
---         • Source account status must be ACTIVE
---         • Destination account status must be ACTIVE
---         • Source balance >= amount
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 29–33** (`transferService`)
 
--- STEP 5: Insert transaction record
+**Deadlock prevention**: Accounts are always locked in ascending `id` order (`[fromId, toId].sort()` at line 28), making a circular wait impossible between concurrent threads.
+
+---
+
+### Step 3 — Insert transaction record (PENDING / PENDING_APPROVAL)
+
+```sql
 INSERT INTO transactions
-  (from_account_id, to_account_id, amount, transaction_type, status,
-   idempotency_key, requires_approval)
-VALUES
-  (:fromAccountId, :toAccountId, :amount, 'TRANSFER', 'PENDING',
-   :idempotencyKey, :requiresApproval);
+  (from_account_id, to_account_id, amount, transaction_type,
+   status, idempotency_key, requires_approval)
+VALUES (?, ?, ?, 'TRANSFER', ?, ?, ?)
+```
 
--- ── Branch A: Normal transfer (requiresApproval = FALSE) ──────────────────
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 60–65** (`transferService`)
 
--- STEP 6a-1: Debit source (with optimistic lock version check)
+---
+
+### Step 4a — Debit source (optimistic lock check)
+
+```sql
 UPDATE accounts
-SET balance = balance - :amount,
-    version = version + 1
-WHERE id = :fromAccountId
-  AND version = :currentVersion;
--- affectedRows === 0 → concurrent modification detected → ROLLBACK + 409
+SET balance = balance - ?, version = version + 1
+WHERE id = ? AND version = ?
+```
 
--- STEP 6a-2: Credit destination
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 70–74** (`transferService`)
+
+`affectedRows === 0` → concurrent modification detected → `ROLLBACK` + HTTP 409.
+
+---
+
+### Step 4b — Credit destination
+
+```sql
 UPDATE accounts
-SET balance = balance + :amount,
-    version = version + 1
-WHERE id = :toAccountId;
+SET balance = balance + ?, version = version + 1
+WHERE id = ?
+```
 
--- STEP 6a-3: Mark transaction as success
-UPDATE transactions
-SET status = 'SUCCESS'
-WHERE id = :transactionId;
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 79–82** (`transferService`)
 
--- STEP 6a-4: Audit log
+---
+
+### Step 4c — Mark transaction SUCCESS
+
+```sql
+UPDATE transactions SET status = 'SUCCESS' WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Line 83** (`transferService`)
+
+---
+
+### Step 4d — Audit log (transfer success)
+
+```sql
 INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:transactionId, 'TRANSFER_SUCCESS',
-        '{"from": ":fromAccNum", "to": ":toAccNum", "amount": :amount}');
+VALUES (?, 'TRANSFER_SUCCESS', ?)
+```
 
--- ── Branch B: High-amount (requiresApproval = TRUE) ───────────────────────
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 84–87** (`transferService`)
 
--- STEP 6b-1: Transaction stays in PENDING_APPROVAL, no money moved yet
+---
+
+### Step 4e (branch B) — Audit log for high-amount pending
+
+```sql
 INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:transactionId, 'TRANSFER_PENDING_APPROVAL',
-        '{"from": ":fromAccNum", "to": ":toAccNum", "amount": :amount}');
-
--- STEP 7: Commit
-COMMIT;
+VALUES (?, 'TRANSFER_PENDING_APPROVAL', ?)
 ```
 
-### Locking Diagram
-
-```
-Thread A transfers from acc_id=3 → acc_id=7
-Thread B transfers from acc_id=7 → acc_id=3
-
-WITHOUT ordering:           WITH ascending-ID ordering:
-A locks acc 3 ──────────►  A locks acc 3 ──────────►
-B locks acc 7 ──────────►  B locks acc 3 ──── WAITS ►
-A waits for acc 7 ──────►  A locks acc 7 ──────────►
-B waits for acc 3 ──────►  A commits, B proceeds
-          ↕
-       DEADLOCK           NO DEADLOCK ✓
-```
-
-### Variables
-
-| Variable | Source |
-|---|---|
-| `:fromAccountId` | POST body `from_account_id` |
-| `:toAccountId` | POST body `to_account_id` |
-| `:amount` | POST body `amount` (parsed float) |
-| `:idempotencyKey` | POST body or `uuidv4()` auto-generated |
-| `:currentVersion` | Read from locked account row (optimistic locking) |
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 90–93** (`transferService`)
 
 ---
 
@@ -355,35 +448,58 @@ B waits for acc 3 ──────►  A commits, B proceeds
 
 **Endpoint**: `POST /api/transactions/deposit`
 
+All inside `BEGIN … COMMIT`.
+
+### 8.1 Idempotency check
+
 ```sql
-BEGIN;
-
--- Idempotency check
-SELECT id, status FROM transactions WHERE idempotency_key = :idempotencyKey;
-
--- Lock target account
-SELECT id, status FROM accounts WHERE id = :accountId FOR UPDATE;
-
--- Insert transaction
-INSERT INTO transactions
-  (from_account_id, to_account_id, amount, transaction_type, status, idempotency_key)
-VALUES (NULL, :accountId, :amount, 'DEPOSIT', 'PENDING', :idempotencyKey);
-
--- Credit account
-UPDATE accounts SET balance = balance + :amount WHERE id = :accountId;
-
--- Mark success
-UPDATE transactions SET status = 'SUCCESS' WHERE id = :transactionId;
-
--- Audit
-INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:transactionId, 'DEPOSIT_SUCCESS',
-        '{"account_id": :accountId, "amount": :amount}');
-
-COMMIT;
+SELECT id, status FROM transactions WHERE idempotency_key = ?
 ```
 
-**Index hit**: PRIMARY KEY on `accounts.id` for the `FOR UPDATE` lock.
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Line 113** (`depositService`)
+
+---
+
+### 8.2 Lock target account
+
+```sql
+SELECT id, status FROM accounts WHERE id = ? FOR UPDATE
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Line 116** (`depositService`)
+
+---
+
+### 8.3 Insert deposit transaction
+
+```sql
+INSERT INTO transactions
+  (from_account_id, to_account_id, amount, transaction_type, status, idempotency_key)
+VALUES (NULL, ?, ?, 'DEPOSIT', 'PENDING', ?)
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 120–123** (`depositService`)
+
+---
+
+### 8.4 Credit account balance
+
+```sql
+UPDATE accounts SET balance = balance + ? WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Line 125** (`depositService`)
+
+---
+
+### 8.5 Mark deposit SUCCESS + audit
+
+```sql
+UPDATE transactions SET status = 'SUCCESS' WHERE id = ?
+INSERT INTO audit_logs (transaction_id, event, metadata) VALUES (?, 'DEPOSIT_SUCCESS', ?)
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 126–128** (`depositService`)
 
 ---
 
@@ -391,100 +507,128 @@ COMMIT;
 
 **Endpoint**: `POST /api/transactions/withdraw`
 
+All inside `BEGIN … COMMIT`.
+
+### 9.1 Idempotency check
+
 ```sql
-BEGIN;
+SELECT id, status FROM transactions WHERE idempotency_key = ?
+```
 
-SELECT id, status FROM transactions WHERE idempotency_key = :idempotencyKey;
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Line 139** (`withdrawService`)
 
-SELECT id, balance, status FROM accounts WHERE id = :accountId FOR UPDATE;
--- Application checks: status = ACTIVE, balance >= amount
+---
 
+### 9.2 Lock source account (with balance)
+
+```sql
+SELECT id, balance, status FROM accounts WHERE id = ? FOR UPDATE
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Line 142** (`withdrawService`)
+
+---
+
+### 9.3 Insert withdrawal transaction
+
+```sql
 INSERT INTO transactions
   (from_account_id, to_account_id, amount, transaction_type, status, idempotency_key)
-VALUES (:accountId, NULL, :amount, 'WITHDRAWAL', 'PENDING', :idempotencyKey);
-
-UPDATE accounts SET balance = balance - :amount WHERE id = :accountId;
-
-UPDATE transactions SET status = 'SUCCESS' WHERE id = :transactionId;
-
-INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:transactionId, 'WITHDRAWAL_SUCCESS',
-        '{"account_id": :accountId, "amount": :amount}');
-
-COMMIT;
+VALUES (?, NULL, ?, 'WITHDRAWAL', 'PENDING', ?)
 ```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 147–150** (`withdrawService`)
+
+---
+
+### 9.4 Debit balance + mark SUCCESS + audit
+
+```sql
+UPDATE accounts SET balance = balance - ? WHERE id = ?
+UPDATE transactions SET status = 'SUCCESS' WHERE id = ?
+INSERT INTO audit_logs (transaction_id, event, metadata) VALUES (?, 'WITHDRAWAL_SUCCESS', ?)
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 152–155** (`withdrawService`)
 
 ---
 
 ## 10. OTP Verification
 
-Used for transfers ≥ ₹25,000.
-
-### 10.1 Generate OTP
-
-**Endpoint**: `POST /api/transactions/request-otp`
+### 10.1 Generate OTP — invalidate previous
 
 ```sql
--- Invalidate previous unused OTPs
 UPDATE otp_verifications
 SET used = TRUE
-WHERE customer_id = :customerId AND used = FALSE;
-
--- Insert new OTP record
-INSERT INTO otp_verifications (customer_id, otp_code, context, expires_at)
-VALUES (:customerId, :otpCode, :contextJson, :expiresAt);
+WHERE customer_id = ? AND used = FALSE
 ```
 
-| Variable | Value |
-|---|---|
-| `:otpCode` | 6-digit random number (100000–999999) |
-| `:contextJson` | JSON string of `{from_account_id, to_account_id, amount, idempotency_key}` |
-| `:expiresAt` | `NOW() + 5 minutes` |
+> 📄 **Source**: `backend/src/services/otpService.js` — **Lines 14–16** (`generateOTP`)
 
 ---
 
-### 10.2 Verify OTP
-
-**Endpoint**: `POST /api/transactions/verify-otp`
+### 10.2 Generate OTP — insert new record
 
 ```sql
--- Fetch latest unused OTP for customer
-SELECT id, otp_code, context, expires_at, used
-FROM otp_verifications
-WHERE customer_id = :customerId AND used = FALSE
-ORDER BY created_at DESC
-LIMIT 1;
-
--- Application checks:
---   • Row exists
---   • expires_at > NOW()
---   • otp_code === submitted OTP
-
--- Mark as used
-UPDATE otp_verifications SET used = TRUE WHERE id = :otpId;
+INSERT INTO otp_verifications (customer_id, otp_code, context, expires_at)
+VALUES (?, ?, ?, ?)
 ```
 
-After successful verification, the stored `context` JSON is parsed and passed to `transferService` with `requiresApproval = true`, creating a `PENDING_APPROVAL` transaction.
+> 📄 **Source**: `backend/src/services/otpService.js` — **Lines 19–23** (`generateOTP`)
+
+| Variable | Value |
+|---|---|
+| `otp_code` | 6-digit random (100000–999999) |
+| `context` | JSON `{from_account_id, to_account_id, amount, idempotency_key}` |
+| `expires_at` | `NOW() + 5 minutes` |
+
+---
+
+### 10.3 Verify OTP — fetch latest unused
+
+```sql
+SELECT id, otp_code, context, expires_at, used
+FROM otp_verifications
+WHERE customer_id = ? AND used = FALSE
+ORDER BY created_at DESC
+LIMIT 1
+```
+
+> 📄 **Source**: `backend/src/services/otpService.js` — **Lines 33–38** (`verifyOTP`)
+
+---
+
+### 10.4 Verify OTP — mark as used
+
+```sql
+UPDATE otp_verifications SET used = TRUE WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/services/otpService.js` — **Line 56** (`verifyOTP`)
 
 ---
 
 ## 11. Transaction History
 
-**Endpoint**: `GET /api/accounts/:id/transactions?page=0&size=10&type=&status=`
+**Endpoint**: `GET /api/accounts/:id/transactions`
 
-### 11.1 Count query (for pagination metadata)
+### 11.1 Count query (for pagination)
 
 ```sql
 SELECT COUNT(*) AS total
 FROM transactions t
-WHERE (t.from_account_id = :accountId OR t.to_account_id = :accountId)
-  [AND t.transaction_type = :type]
-  [AND t.status = :status]
-  [AND t.created_at >= :from]
-  [AND t.created_at <= :to];
+WHERE (t.from_account_id = ? OR t.to_account_id = ?)
+  [AND t.transaction_type = ?]
+  [AND t.status = ?]
+  [AND t.created_at >= ?]
+  [AND t.created_at <= ?]
 ```
 
-### 11.2 Data query (paginated)
+> 📄 **Source**: `backend/src/controllers/transactionController.js` — **Line 175** (`getTransactionHistory`)
+
+---
+
+### 11.2 Paginated data query
 
 ```sql
 SELECT t.id, t.from_account_id, t.to_account_id, t.amount,
@@ -495,27 +639,28 @@ SELECT t.id, t.from_account_id, t.to_account_id, t.amount,
 FROM transactions t
 LEFT JOIN accounts fa ON t.from_account_id = fa.id
 LEFT JOIN accounts ta ON t.to_account_id   = ta.id
-WHERE (t.from_account_id = :accountId OR t.to_account_id = :accountId)
-  [AND t.transaction_type = :type]
-  [AND t.status = :status]
+WHERE (t.from_account_id = ? OR t.to_account_id = ?)
+  [AND filters...]
 ORDER BY t.created_at DESC
-LIMIT :size OFFSET :offset;
+LIMIT ? OFFSET ?
 ```
+
+> 📄 **Source**: `backend/src/controllers/transactionController.js` — **Lines 177–190** (`getTransactionHistory`)
 
 | Variable | Source |
 |---|---|
-| `:accountId` | URL param `:id` |
-| `:size` | Query param `size` (default 10) |
-| `:offset` | `page * size` |
-| `:type` | Optional filter: `DEPOSIT`, `WITHDRAWAL`, `TRANSFER` |
-| `:status` | Optional filter: `SUCCESS`, `PENDING_APPROVAL`, `FAILED`, `REVERSED` |
+| `accountId` | `req.params.id` |
+| `size` | `req.query.size` (default 20) |
+| `offset` | `page * size` |
+| `type` | Optional `req.query.type` |
+| `status` | Optional `req.query.status` |
 
 **Index hits**:
-- `idx_txn_from_account_id (from_account_id, created_at)` — covers the `from` filter + ORDER BY
-- `idx_txn_to_account_id (to_account_id, created_at)` — covers the `to` filter
-- `idx_txn_created_at (created_at)` — covers ORDER BY when no account filter applies
+- `idx_txn_from_account_id` — covers `from_account_id` filter
+- `idx_txn_to_account_id` — covers `to_account_id` filter
+- `idx_txn_created_at` — covers `ORDER BY`
 
-**Note on `flagged` column**: The `flagged` and `flag_reason` fields are returned here. The frontend reads these and displays an alert banner when any transaction has `flagged = 1`.
+**Customer flag visibility**: The `flagged` and `flag_reason` fields are returned here. The frontend (`frontend/src/pages/Transactions.jsx`) reads these on every load and displays a red dismissible banner when any row has `flagged = 1`.
 
 ---
 
@@ -523,35 +668,40 @@ LIMIT :size OFFSET :offset;
 
 **Endpoint**: `GET /api/admin/dashboard`
 
-Seven individual count/aggregate queries (executed concurrently via `Promise.all`):
+Eight queries executed in sequence (inside a single route handler):
 
 ```sql
-SELECT COUNT(*) AS count FROM customers;
-
-SELECT COUNT(*) AS count FROM accounts;
-
-SELECT COUNT(*) AS count FROM transactions;
-
-SELECT SUM(balance) AS total FROM accounts WHERE status = 'ACTIVE';
-
-SELECT COUNT(*) AS count FROM audit_logs;
-
-SELECT COUNT(*) AS count FROM transactions WHERE status = 'PENDING_APPROVAL';
-
-SELECT COUNT(*) AS count FROM transactions WHERE flagged = TRUE;
-
-SELECT COUNT(*) AS count FROM accounts WHERE status = 'FROZEN';
+-- 1
+SELECT COUNT(*) AS count FROM customers
+-- 2
+SELECT COUNT(*) AS count FROM accounts
+-- 3
+SELECT COUNT(*) AS count FROM transactions
+-- 4
+SELECT SUM(balance) AS total FROM accounts WHERE status = "ACTIVE"
+-- 5
+SELECT COUNT(*) AS count FROM audit_logs
+-- 6
+SELECT COUNT(*) AS count FROM transactions WHERE status = "PENDING_APPROVAL"
+-- 7
+SELECT COUNT(*) AS count FROM transactions WHERE flagged = TRUE
+-- 8
+SELECT COUNT(*) AS count FROM accounts WHERE status = "FROZEN"
 ```
 
+> 📄 **Source**: `backend/src/routes/adminRoutes.js` — **Lines 19–26** (inline route handler in `router.get('/dashboard', ...)`)
+
 **Index hits**:
-- `idx_txn_status (status)` for the `PENDING_APPROVAL` and `flagged` counts
-- `idx_accounts_status (status)` for frozen accounts count
+- `idx_txn_status` for queries 6 & 7
+- `idx_accounts_status` for queries 4 & 8
 
 ---
 
 ## 13. Admin — All Transactions
 
-**Endpoint**: `GET /api/admin/transactions?page=0&size=50`
+**Endpoint**: `GET /api/admin/transactions`
+
+### 13.1 Data query
 
 ```sql
 SELECT t.*,
@@ -565,12 +715,18 @@ LEFT JOIN accounts  ta ON t.to_account_id   = ta.id
 LEFT JOIN customers fc ON fa.customer_id    = fc.id
 LEFT JOIN customers tc ON ta.customer_id    = tc.id
 ORDER BY t.created_at DESC
-LIMIT :size OFFSET :offset;
-
-SELECT COUNT(*) AS total FROM transactions;
+LIMIT ? OFFSET ?
 ```
 
-**Index hit**: `idx_txn_created_at (created_at)` for ORDER BY.
+> 📄 **Source**: `backend/src/controllers/transactionController.js` — **Lines 202–212** (`getAllTransactions`)
+
+### 13.2 Count query
+
+```sql
+SELECT COUNT(*) AS total FROM transactions
+```
+
+> 📄 **Source**: `backend/src/controllers/transactionController.js` — **Line 213** (`getAllTransactions`)
 
 ---
 
@@ -590,12 +746,12 @@ LEFT JOIN accounts  ta ON t.to_account_id   = ta.id
 LEFT JOIN customers fc ON fa.customer_id    = fc.id
 LEFT JOIN customers tc ON ta.customer_id    = tc.id
 WHERE t.status = 'PENDING_APPROVAL'
-ORDER BY t.created_at ASC;
+ORDER BY t.created_at ASC
 ```
 
-**Index hit**: `idx_txn_status (status)` narrows to `PENDING_APPROVAL` rows only.
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 91–104** (`getPendingApprovals`)
 
-**Business logic**: Oldest first (ASC) — admin processes in FIFO order to avoid starvation.
+**Business logic**: Sorted ASC (oldest first) for FIFO admin review — prevents starvation of early submissions.
 
 ---
 
@@ -615,40 +771,52 @@ LEFT JOIN accounts  ta ON t.to_account_id   = ta.id
 LEFT JOIN customers fc ON fa.customer_id    = fc.id
 LEFT JOIN customers tc ON ta.customer_id    = tc.id
 WHERE t.flagged = TRUE
-ORDER BY t.created_at DESC;
+ORDER BY t.created_at DESC
 ```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 113–126** (`getFlaggedTransactions`)
 
 ---
 
 ## 16. Admin — Flag / Unflag
 
-### Flag
+### 16.1 Flag a transaction
 
 **Endpoint**: `PUT /api/admin/transactions/:id/flag`
 
 ```sql
-UPDATE transactions
-SET flagged = TRUE, flag_reason = :reason
-WHERE id = :transactionId;
-
-INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:transactionId, 'TRANSACTION_FLAGGED',
-        '{"reason": ":reason", "flagged_by": :adminId}');
+UPDATE transactions SET flagged = TRUE, flag_reason = ? WHERE id = ?
 ```
 
-**Effect on customer**: The `flagged` and `flag_reason` fields are returned by the transaction history endpoint. The frontend detects any `flagged = 1` rows and shows a prominent red banner at the top of the Transactions page.
-
-### Unflag
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 11–14** (`flagTransaction`)
 
 ```sql
-UPDATE transactions
-SET flagged = FALSE, flag_reason = NULL
-WHERE id = :transactionId;
-
 INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:transactionId, 'TRANSACTION_UNFLAGGED',
-        '{"unflagged_by": :adminId}');
+VALUES (?, 'TRANSACTION_FLAGGED', ?)
 ```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 17–20** (`flagTransaction`)
+
+**Customer visibility**: The flagged status is returned by the transaction history endpoint (section 11). The frontend `Transactions.jsx` (lines 225–229) filters `rows.filter(t => t.flagged)` and surfaces a red alert banner at the top of the page.
+
+---
+
+### 16.2 Unflag a transaction
+
+**Endpoint**: `PUT /api/admin/transactions/:id/unflag`
+
+```sql
+UPDATE transactions SET flagged = FALSE, flag_reason = NULL WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 27–30** (`unflagTransaction`)
+
+```sql
+INSERT INTO audit_logs (transaction_id, event, metadata)
+VALUES (?, 'TRANSACTION_UNFLAGGED', ?)
+```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 33–36** (`unflagTransaction`)
 
 ---
 
@@ -656,50 +824,75 @@ VALUES (:transactionId, 'TRANSACTION_UNFLAGGED',
 
 **Endpoint**: `PUT /api/admin/transactions/:id/reverse`
 
-Only `SUCCESS` + `TRANSFER` transactions can be reversed.
+All inside `BEGIN … COMMIT` in `reverseTransactionService`.
+
+### 17.1 Lock original transaction
 
 ```sql
-BEGIN;
-
--- Lock original transaction row
-SELECT * FROM transactions WHERE id = :transactionId FOR UPDATE;
--- Validate: status = 'SUCCESS' AND transaction_type = 'TRANSFER'
-
--- Lock both accounts (ascending ID order, same deadlock prevention)
-SELECT id, balance, status, version, account_number
-FROM accounts
-WHERE id IN (:lowerAccountId, :higherAccountId)
-ORDER BY id ASC
-FOR UPDATE;
--- Validate: destination account has enough balance for reversal
-
--- Mark original as REVERSED
-UPDATE transactions SET status = 'REVERSED' WHERE id = :transactionId;
-
--- Create reversal transaction (money flows back: to→from)
-INSERT INTO transactions
-  (from_account_id, to_account_id, amount, transaction_type, status,
-   idempotency_key, requires_approval)
-VALUES
-  (:originalToAccountId, :originalFromAccountId, :amount, 'TRANSFER', 'SUCCESS',
-   :reverseKey, 0);
-
--- Move money back
-UPDATE accounts SET balance = balance - :amount, version = version + 1
-WHERE id = :originalToAccountId;
-
-UPDATE accounts SET balance = balance + :amount, version = version + 1
-WHERE id = :originalFromAccountId;
-
--- Audit
-INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:reversalTransactionId, 'TRANSACTION_REVERSED',
-        '{"original_txn_id": :transactionId, "reversed_by": :adminId}');
-
-COMMIT;
+SELECT * FROM transactions WHERE id = ? FOR UPDATE
 ```
 
-**Business logic**: Creates a brand-new transaction record (the reversal) rather than deleting the original. This preserves the full audit trail — the original shows `REVERSED`, and the new one shows `SUCCESS` flowing in the opposite direction.
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 171–173** (`reverseTransactionService`)
+
+---
+
+### 17.2 Lock both accounts (ascending ID order)
+
+```sql
+SELECT id, balance, status, version, account_number
+FROM accounts
+WHERE id IN (?, ?)
+ORDER BY id ASC
+FOR UPDATE
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 184–187** (`reverseTransactionService`)
+
+---
+
+### 17.3 Mark original as REVERSED
+
+```sql
+UPDATE transactions SET status = 'REVERSED' WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Line 197** (`reverseTransactionService`)
+
+---
+
+### 17.4 Create reversal transaction record
+
+```sql
+INSERT INTO transactions
+  (from_account_id, to_account_id, amount, transaction_type, status, idempotency_key, requires_approval)
+VALUES (?, ?, ?, 'TRANSFER', 'SUCCESS', ?, 0)
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 201–205** (`reverseTransactionService`)
+
+---
+
+### 17.5 Move money back
+
+```sql
+UPDATE accounts SET balance = balance - ?, version = version + 1 WHERE id = ?
+UPDATE accounts SET balance = balance + ?, version = version + 1 WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 208–209** (`reverseTransactionService`)
+
+---
+
+### 17.6 Audit log
+
+```sql
+INSERT INTO audit_logs (transaction_id, event, metadata)
+VALUES (?, 'TRANSACTION_REVERSED', ?)
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 212–215** (`reverseTransactionService`)
+
+**Business logic**: Creates a new transaction record (the reversal) — never deletes the original. Original shows `REVERSED`, new record shows `SUCCESS` flowing in the opposite direction.
 
 ---
 
@@ -707,39 +900,65 @@ COMMIT;
 
 **Endpoint**: `PUT /api/admin/transactions/:id/approve`
 
-Moves money for a `PENDING_APPROVAL` transfer.
+All inside `BEGIN … COMMIT` in `approveTransactionService`.
+
+### 18.1 Lock transaction
 
 ```sql
-BEGIN;
-
-SELECT * FROM transactions WHERE id = :transactionId FOR UPDATE;
--- Validate: status = 'PENDING_APPROVAL'
-
-SELECT id, balance, status, version
-FROM accounts
-WHERE id IN (:lowerAccountId, :higherAccountId)
-ORDER BY id ASC
-FOR UPDATE;
--- Validate: source ACTIVE, balance still sufficient
-
-UPDATE accounts SET balance = balance - :amount, version = version + 1
-WHERE id = :fromAccountId;
-
-UPDATE accounts SET balance = balance + :amount, version = version + 1
-WHERE id = :toAccountId;
-
-UPDATE transactions
-SET status = 'SUCCESS', approved_by = :adminId, approved_at = NOW()
-WHERE id = :transactionId;
-
-INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:transactionId, 'TRANSFER_APPROVED',
-        '{"approved_by": :adminId, "amount": :amount}');
-
-COMMIT;
+SELECT * FROM transactions WHERE id = ? FOR UPDATE
 ```
 
-**Note**: Balance is re-validated at approval time. If the customer spent their balance before approval, the approval will correctly fail with "Insufficient balance at time of approval."
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Line 230** (`approveTransactionService`)
+
+---
+
+### 18.2 Lock accounts (ascending ID)
+
+```sql
+SELECT id, balance, status, version
+FROM accounts
+WHERE id IN (?, ?)
+ORDER BY id ASC
+FOR UPDATE
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 239–242** (`approveTransactionService`)
+
+---
+
+### 18.3 Debit source / Credit destination
+
+```sql
+UPDATE accounts SET balance = balance - ?, version = version + 1 WHERE id = ?
+UPDATE accounts SET balance = balance + ?, version = version + 1 WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 253–254** (`approveTransactionService`)
+
+---
+
+### 18.4 Mark approved
+
+```sql
+UPDATE transactions
+SET status = 'SUCCESS', approved_by = ?, approved_at = NOW()
+WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 257–260** (`approveTransactionService`)
+
+---
+
+### 18.5 Audit log
+
+```sql
+INSERT INTO audit_logs (transaction_id, event, metadata)
+VALUES (?, 'TRANSFER_APPROVED', ?)
+```
+
+> 📄 **Source**: `backend/src/services/transactionService.js` — **Lines 262–265** (`approveTransactionService`)
+
+**Note**: Balance re-validated at approval time (line 249). If the customer spent their balance before admin approval, it correctly fails with "Insufficient balance at time of approval."
 
 ---
 
@@ -747,55 +966,82 @@ COMMIT;
 
 **Endpoint**: `PUT /api/admin/transactions/:id/reject`
 
+### 19.1 Validate status
+
 ```sql
-SELECT status FROM transactions WHERE id = :transactionId;
--- Validate: status = 'PENDING_APPROVAL'
-
-UPDATE transactions
-SET status = 'FAILED',
-    flag_reason = CONCAT('Rejected by admin: ', :reason)
-WHERE id = :transactionId;
-
-INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:transactionId, 'TRANSFER_REJECTED',
-        '{"rejected_by": :adminId, "reason": ":reason"}');
+SELECT status FROM transactions WHERE id = ?
 ```
 
-**Note**: No money was ever held (PENDING_APPROVAL doesn't debit the source), so no rollback of funds is needed on rejection.
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 68–70** (`rejectTransaction`)
+
+---
+
+### 19.2 Mark as FAILED
+
+```sql
+UPDATE transactions
+SET status = 'FAILED', flag_reason = ?
+WHERE id = ?
+```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 75–78** (`rejectTransaction`)
+
+---
+
+### 19.3 Audit log
+
+```sql
+INSERT INTO audit_logs (transaction_id, event, metadata)
+VALUES (?, 'TRANSFER_REJECTED', ?)
+```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 79–82** (`rejectTransaction`)
+
+**Note**: No funds were held during `PENDING_APPROVAL`, so no balance rollback is needed on rejection.
 
 ---
 
 ## 20. Admin — Block / Unblock Account
 
-### Block (FREEZE)
+### 20.1 Block (FREEZE)
 
 **Endpoint**: `PUT /api/admin/accounts/:id/block`
 
 ```sql
-UPDATE accounts
-SET status = 'FROZEN'
-WHERE id = :accountId AND status != 'CLOSED';
-
-INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (NULL, 'ACCOUNT_BLOCKED',
-        '{"account_id": :accountId, "reason": ":reason", "blocked_by": :adminId}');
+UPDATE accounts SET status = 'FROZEN'
+WHERE id = ? AND status != 'CLOSED'
 ```
 
-**Guard**: Only non-CLOSED accounts can be frozen (`AND status != 'CLOSED'`). If `affectedRows = 0`, the account either doesn't exist or is already closed.
-
-### Unblock
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 136–139** (`blockAccount`)
 
 ```sql
-UPDATE accounts
-SET status = 'ACTIVE'
-WHERE id = :accountId AND status = 'FROZEN';
-
 INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (NULL, 'ACCOUNT_UNBLOCKED',
-        '{"account_id": :accountId, "unblocked_by": :adminId}');
+VALUES (NULL, 'ACCOUNT_BLOCKED', ?)
 ```
 
-**Guard**: Only `FROZEN` accounts can be unblocked.
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 142–145** (`blockAccount`)
+
+**Guard**: `AND status != 'CLOSED'` — `affectedRows = 0` means account doesn't exist or is already closed.
+
+---
+
+### 20.2 Unblock (ACTIVE)
+
+**Endpoint**: `PUT /api/admin/accounts/:id/unblock`
+
+```sql
+UPDATE accounts SET status = 'ACTIVE'
+WHERE id = ? AND status = 'FROZEN'
+```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 152–155** (`unblockAccount`)
+
+```sql
+INSERT INTO audit_logs (transaction_id, event, metadata)
+VALUES (NULL, 'ACCOUNT_UNBLOCKED', ?)
+```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 158–161** (`unblockAccount`)
 
 ---
 
@@ -811,8 +1057,10 @@ SELECT a.id, a.account_number, a.account_type, a.balance,
        c.email AS customer_email
 FROM accounts a
 JOIN customers c ON a.customer_id = c.id
-ORDER BY a.created_at DESC;
+ORDER BY a.created_at DESC
 ```
+
+> 📄 **Source**: `backend/src/controllers/adminController.js` — **Lines 169–175** (`getAllAccounts`)
 
 ---
 
@@ -823,39 +1071,38 @@ ORDER BY a.created_at DESC;
 ```sql
 SELECT id, name, email, phone, role, created_at
 FROM customers
-ORDER BY created_at DESC;
+ORDER BY created_at DESC
 ```
+
+> 📄 **Source**: `backend/src/controllers/customerController.js` — **Lines 44–46** (`getAllCustomers`)
 
 ---
 
 ## 23. Audit Logs
 
-Audit logs are written as side-effects of every mutation. They are append-only and never deleted.
-
-### Event Catalogue
-
-| Event | Trigger |
-|---|---|
-| `DEPOSIT_SUCCESS` | Deposit completes |
-| `WITHDRAWAL_SUCCESS` | Withdrawal completes |
-| `TRANSFER_SUCCESS` | Transfer completes |
-| `TRANSFER_PENDING_APPROVAL` | High-amount transfer queued |
-| `TRANSFER_APPROVED` | Admin approves pending transfer |
-| `TRANSFER_REJECTED` | Admin rejects pending transfer |
-| `TRANSACTION_REVERSED` | Admin reverses a success transfer |
-| `TRANSACTION_FLAGGED` | Admin flags a transaction |
-| `TRANSACTION_UNFLAGGED` | Admin removes flag |
-| `ACCOUNT_BLOCKED` | Admin freezes an account |
-| `ACCOUNT_UNBLOCKED` | Admin unfreezes an account |
-
-### Write pattern (all events)
+All audit log writes use the same INSERT pattern. They are append-only, never deleted.
 
 ```sql
 INSERT INTO audit_logs (transaction_id, event, metadata)
-VALUES (:txnId, ':eventName', :jsonMetadata);
+VALUES (?, '<EVENT_NAME>', ?)
 ```
 
-`transaction_id` is `NULL` for account-level events (block/unblock).
+### Event → Source File Cross-Reference
+
+| Event | Source File | Line(s) |
+|---|---|---|
+| `DEPOSIT_SUCCESS` | `backend/src/services/transactionService.js` | 127–128 |
+| `WITHDRAWAL_SUCCESS` | `backend/src/services/transactionService.js` | 154–155 |
+| `TRANSFER_SUCCESS` | `backend/src/services/transactionService.js` | 84–87 |
+| `TRANSFER_PENDING_APPROVAL` | `backend/src/services/transactionService.js` | 90–93 |
+| `TRANSFER_APPROVED` | `backend/src/services/transactionService.js` | 262–265 |
+| `TRANSFER_REJECTED` | `backend/src/controllers/adminController.js` | 79–82 |
+| `TRANSACTION_REVERSED` | `backend/src/services/transactionService.js` | 212–215 |
+| `TRANSACTION_FLAGGED` | `backend/src/controllers/adminController.js` | 17–20 |
+| `TRANSACTION_UNFLAGGED` | `backend/src/controllers/adminController.js` | 33–36 |
+| `ACCOUNT_BLOCKED` | `backend/src/controllers/adminController.js` | 142–145 |
+| `ACCOUNT_UNBLOCKED` | `backend/src/controllers/adminController.js` | 158–161 |
+| `ACCOUNT_STATUS_CHANGED` | `backend/src/controllers/accountController.js` | 113–117 |
 
 ---
 
@@ -863,65 +1110,64 @@ VALUES (:txnId, ':eventName', :jsonMetadata);
 
 ### FOR UPDATE vs FOR SHARE
 
-| Lock | SQL | Use case |
+| Lock | Used At | Purpose |
 |---|---|---|
-| `FOR SHARE` (shared read lock) | `SELECT … FOR SHARE` | Idempotency check — allows concurrent reads of the same key, blocks writers |
-| `FOR UPDATE` (exclusive write lock) | `SELECT … FOR UPDATE` | Account balance modification — blocks all other reads and writes of the locked rows |
+| `FOR SHARE` | `transactionService.js:18` (idempotency check) | Allows concurrent reads of the same key, blocks writers |
+| `FOR UPDATE` | `transactionService.js:29` (account lock, transfer) | Exclusive — blocks all other reads and writes of locked rows |
+| `FOR UPDATE` | `transactionService.js:116` (deposit account lock) | Exclusive account lock before crediting |
+| `FOR UPDATE` | `transactionService.js:142` (withdraw account lock) | Exclusive account lock before debiting |
+| `FOR UPDATE` | `transactionService.js:171` (reverse: original txn) | Prevents concurrent reversal of same transaction |
+| `FOR UPDATE` | `transactionService.js:184` (reverse: accounts) | Exclusive lock for balance movement |
+| `FOR UPDATE` | `transactionService.js:230` (approve: transaction) | Prevents concurrent approval |
+| `FOR UPDATE` | `transactionService.js:239` (approve: accounts) | Exclusive lock for balance movement |
 
 ### Optimistic Locking (version column)
 
-Every account has a `version INT` column incremented on each balance change:
-
 ```sql
--- Debit with optimistic lock check
+-- transactionService.js lines 70–74
 UPDATE accounts
-SET balance = balance - :amount, version = version + 1
-WHERE id = :fromAccountId AND version = :expectedVersion;
+SET balance = balance - ?, version = version + 1
+WHERE id = ? AND version = ?
+-- affectedRows = 0 → concurrent modification → ROLLBACK + HTTP 409
 ```
-
-If `affectedRows = 0`, another concurrent transaction modified this account between our `SELECT FOR UPDATE` and `UPDATE`. The application rolls back and returns HTTP 409 Conflict, asking the client to retry.
-
-This is a double safety net — `FOR UPDATE` prevents simultaneous modifications, but the version check catches the rare race between connection checkout and actual write.
-
-### Transaction Isolation Level
-
-MySQL default: **REPEATABLE READ**. Within a single transaction, all reads see the same snapshot as of the transaction start — except rows locked with `FOR UPDATE` or `FOR SHARE`, which always read the latest committed version.
 
 ### Deadlock Prevention Strategy
 
 ```
-Always acquire locks in ascending account_id order.
-
-If transferring A → B:
-  lockOrder = [min(A.id, B.id), max(A.id, B.id)]
-  SELECT ... WHERE id IN (lockOrder[0], lockOrder[1]) ORDER BY id ASC FOR UPDATE
+-- transactionService.js line 28 (transfer) and line 183 (reversal)
+const lockOrder = [fromAccountId, toAccountId].sort((a, b) => a - b);
 ```
 
-This guarantees that any two concurrent threads competing for the same two accounts will always request the locks in the same order, making a circular wait impossible.
+Always acquire row locks in ascending `account_id` order. Two concurrent threads competing for the same two accounts always request locks in the same order — making a circular wait structurally impossible.
+
+```
+Thread A: acc_id=3 → acc_id=7   Thread B: acc_id=7 → acc_id=3
+WITHOUT ordering → DEADLOCK      WITH ascending order → B waits for 3, no deadlock ✓
+```
 
 ---
 
 ## 25. Index Usage Summary
 
-| Index | Columns | Used By |
-|---|---|---|
-| `PRIMARY` on `customers` | `id` | Auth middleware, profile GET |
-| `idx_customers_email` | `email` | Login |
-| `PRIMARY` on `accounts` | `id` | Every deposit/withdrawal/transfer lock |
-| `idx_accounts_customer_id` | `customer_id` | List my accounts, beneficiary joins |
-| `idx_accounts_account_number` | `account_number` | Account lookup for transfer |
-| `idx_accounts_status` | `status` | Admin dashboard frozen count |
-| `PRIMARY` on `transactions` | `id` | Every reversal/approval lock |
-| `idx_txn_idempotency_key` | `idempotency_key` | Idempotency check |
-| `idx_txn_from_account_id` | `from_account_id, created_at` | History query + ORDER BY |
-| `idx_txn_to_account_id` | `to_account_id, created_at` | History query + ORDER BY |
-| `idx_txn_status` | `status` | Pending approval count, flagged list |
-| `idx_txn_created_at` | `created_at` | Admin all-transactions ORDER BY |
-| `idx_audit_transaction_id` | `transaction_id` | Audit lookup per transaction |
-| `idx_audit_event` | `event` | Event-type filtering |
-| `idx_audit_created_at` | `created_at` | Audit log chronological listing |
-| `idx_bene_customer_id` | `customer_id` | List beneficiaries |
-| `uq_bene_customer_account` | `customer_id, account_id` | Duplicate beneficiary prevention |
+| Index Name | Table | Columns | Used By (file:line) |
+|---|---|---|---|
+| `PRIMARY` | `customers` | `id` | `customerController.js:9`, `auth middleware` |
+| `idx_customers_email` | `customers` | `email` | `authController.js:19`, `authController.js:55` |
+| `PRIMARY` | `accounts` | `id` | Every `FOR UPDATE` lock in `transactionService.js` |
+| `idx_accounts_customer_id` | `accounts` | `customer_id` | `accountController.js:53`, `beneficiaryController.js:40` |
+| `idx_accounts_account_number` | `accounts` | `account_number` | `accountController.js:136` |
+| `idx_accounts_status` | `accounts` | `status` | `adminRoutes.js:22`, `adminRoutes.js:26` |
+| `PRIMARY` | `transactions` | `id` | `transactionService.js:171`, `transactionService.js:230` |
+| `idx_txn_idempotency_key` | `transactions` | `idempotency_key` | `transactionService.js:18`, `transactionService.js:113`, `transactionService.js:139` |
+| `idx_txn_from_account_id` | `transactions` | `from_account_id, created_at` | `transactionController.js:175,177` |
+| `idx_txn_to_account_id` | `transactions` | `to_account_id, created_at` | `transactionController.js:175,177` |
+| `idx_txn_status` | `transactions` | `status` | `adminRoutes.js:24`, `adminController.js:91` |
+| `idx_txn_created_at` | `transactions` | `created_at` | `transactionController.js:202`, `adminController.js:113` |
+| `idx_audit_transaction_id` | `audit_logs` | `transaction_id` | All audit INSERTs |
+| `idx_audit_event` | `audit_logs` | `event` | Event filtering |
+| `idx_audit_created_at` | `audit_logs` | `created_at` | Chronological listing |
+| `idx_bene_customer_id` | `beneficiaries` | `customer_id` | `beneficiaryController.js:40` |
+| `uq_bene_customer_account` | `beneficiaries` | `customer_id, account_id` | `beneficiaryController.js:18` (duplicate prevention) |
 
 ---
 
